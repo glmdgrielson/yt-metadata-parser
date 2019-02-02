@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math/rand"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,6 +36,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -70,6 +73,8 @@ var cmdFlags = struct {
 	RemoveRedundantData  bool
 	UseSockProxy         bool
 	SubPathLen           int
+	MasterServer         string
+	Concurrency          int64
 }{
 	true,  //DeepDirFormat
 	false, //GetAutoSub
@@ -77,9 +82,20 @@ var cmdFlags = struct {
 	false, //GetAnnotation
 	true,  //GetThumbnail
 	false, //DualFormatExistCheck
-	false,
-	true,
+	true,  // RemoveRedundantData
+	false, //UseSockProxy
 	2,
+	"",
+	8,
+}
+
+var combinedOutFile = struct {
+	mutex   sync.Mutex // this mutex protects the file
+	outFile io.Writer
+	recID   int64
+}{
+	outFile: nil,
+	recID:   0,
 }
 
 // Video structure containing all metadata for the video
@@ -136,36 +152,36 @@ type HeadlineBadge struct {
 
 // infoJSON structure containing the generated json data
 type infoJSON struct {
-	Version         int                   `json:"v"`
-	ID              string                `json:"id"`
-	FetchedDate     string                `json:"fetch_date,omitempty"`
-	Uploader        string                `json:"uploader,omitempty"`
-	UploaderID      string                `json:"uploader_id,omitempty"`
-	UploaderURL     string                `json:"uploader_url,omitempty"`
-	UploadDate      string                `json:"upload_date,omitempty"`
-	License         string                `json:"license,omitempty"`
-	Creator         string                `json:"creator,omitempty"`
-	Title           string                `json:"title,omitempty"`
-	AltTitle        string                `json:"alt_title,omitempty"`
-	Thumbnail       string                `json:"thumbnail,omitempty"`
-	Description     string                `json:"description,omitempty"`
-	Category        string                `json:"category,omitempty"`
-	Tags            []string              `json:"tags,omitempty"`
-	Subtitles       map[string][]Subtitle `json:"subtitles,omitempty"`
-	Duration        int64                 `json:"duration"`
-	AgeLimit        float64               `json:"age_limit"`
-	Annotations     string                `json:"annotations,omitempty"`
-	WebpageURL      string                `json:"webpage_url,omitempty"`
-	ViewCount       int64                 `json:"view_count"`
-	LikeCount       int64                 `json:"like_count"`
-	DislikeCount    int64                 `json:"dislike_count"`
-	AverageRating   float64               `json:"average_rating"`
-	AllowEmbed      bool                  `json:"allow_embed"`
-	IsCrawlable     bool                  `json:"is_crawlable"`
-	AllowSubContrib bool                  `json:"allow_sub_contrib"`
-	IsLiveContent   bool                  `json:"is_live_content"`
-	IsAdsEnabled    bool                  `json:"is_ads_enabled"`
-	//IsCommentsEnabled    bool                  `json:"is_comments_enabled"`
+	Version           int                   `json:"v"`
+	ID                string                `json:"id"`
+	FetchedDate       string                `json:"fetch_date,omitempty"`
+	Uploader          string                `json:"uploader,omitempty"`
+	UploaderID        string                `json:"uploader_id,omitempty"`
+	UploaderURL       string                `json:"uploader_url,omitempty"`
+	UploadDate        string                `json:"upload_date,omitempty"`
+	License           string                `json:"license,omitempty"`
+	Creator           string                `json:"creator,omitempty"`
+	Title             string                `json:"title,omitempty"`
+	AltTitle          string                `json:"alt_title,omitempty"`
+	Thumbnail         string                `json:"thumbnail,omitempty"`
+	Description       string                `json:"description,omitempty"`
+	Category          string                `json:"category,omitempty"`
+	Tags              []string              `json:"tags,omitempty"`
+	Subtitles         map[string][]Subtitle `json:"subtitles,omitempty"`
+	Duration          int64                 `json:"duration"`
+	AgeLimit          float64               `json:"age_limit"`
+	Annotations       string                `json:"annotations,omitempty"`
+	WebpageURL        string                `json:"webpage_url,omitempty"`
+	ViewCount         int64                 `json:"view_count"`
+	LikeCount         int64                 `json:"like_count"`
+	DislikeCount      int64                 `json:"dislike_count"`
+	AverageRating     float64               `json:"average_rating"`
+	AllowEmbed        bool                  `json:"allow_embed"`
+	IsCrawlable       bool                  `json:"is_crawlable"`
+	AllowSubContrib   bool                  `json:"allow_sub_contrib"`
+	IsLiveContent     bool                  `json:"is_live_content"`
+	IsAdsEnabled      bool                  `json:"is_ads_enabled"`
+	IsCommentsEnabled bool                  `json:"is_comments_enabled"`
 	//TODO fill AllowSubContrib, IsLiveContent, LocationTag,LocationHash, resolutions
 	Formats            []Format           `json:"formats,omitempty"`
 	Credits            []Credit           `json:"credits,omitempty"`
@@ -181,6 +197,7 @@ func (e *infoJSON) Init() {
 	e.IsCrawlable = true
 	e.AllowSubContrib = false
 	e.IsLiveContent = false
+	e.IsCommentsEnabled = true
 }
 
 //Subtitle structure
@@ -212,10 +229,52 @@ type Format struct {
 	Size         string  `json:"size,omitempty"`
 }
 
+// Format structure video quality labels
 type QualityLabel struct {
 	ID       int
 	Label    string
 	Priority int
+}
+
+type workBatch struct {
+	BatchID   string   `json:"batch_id"`
+	BatchUUID string   `json:"batch_uuid"`
+	VideoIDS  []string `json:"videos_ids,omitempty"`
+	Message   string   `json:"message,omitempty"`
+}
+
+func sendMultipart(url string, params map[string]string, field string, name string) (*http.Response, error) {
+	r, w := io.Pipe()
+	mWriter := multipart.NewWriter(w)
+
+	go func() {
+		defer w.Close()
+		defer mWriter.Close()
+
+		for key, val := range params {
+			_ = mWriter.WriteField(key, val)
+		}
+
+		fWriter, err := mWriter.CreateFormFile(field, name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "CreateFormFile failed: %v\n", err)
+			return
+		}
+
+		file, err := os.Open(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Open file %s failed: %v\n", name, err)
+			return
+		}
+		defer file.Close()
+
+		if _, err = io.Copy(fWriter, file); err != nil {
+			fmt.Fprintf(os.Stderr, "io.Copy failed: %v\n", err)
+			return
+		}
+	}()
+
+	return http.Post(url, mWriter.FormDataContentType(), r)
 }
 
 var qualityLabels = map[string]QualityLabel{}
@@ -229,42 +288,27 @@ func getRandTransport() *http.Transport {
 	return outTransports[rand.Intn(len(outTransports))]
 }
 
-func loadOutIpsFromFile(ipsFile string) {
-	b, err := ioutil.ReadFile(ipsFile) // just pass the file name
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot read out ip file: %v\n", err)
-		runtime.Goexit()
-	}
-	//fmt.Println(b) // print the content as 'bytes'
-
-	str := string(b) // convert content to a 'string'
-
-	//fmt.Println(str) // print the content as a 'string'
-	lines := strings.Split(str, "\n")
-	for _, f := range lines {
-		if len(f) > 2 {
-			fmt.Println(f)
-			a := &net.TCPAddr{
-				IP: net.ParseIP(strings.TrimSpace(f))}
-			var transport = &http.Transport{
-				Dial: (&net.Dialer{
-					Timeout:   15 * time.Second,
-					KeepAlive: 15 * time.Second,
-					LocalAddr: a,
-				}).Dial,
-				TLSHandshakeTimeout: 10 * time.Second,
-				MaxIdleConns:        30,
-				MaxIdleConnsPerHost: 30,
-				IdleConnTimeout:     25 * time.Second,
-			}
-			outTransports = append(outTransports, transport)
-		}
-	}
-	fmt.Printf("Loaded %d out ips\n", len(lines))
-}
-
 func random(min int64, max int64) int64 {
 	return rand.Int63n(max-min) + min
+}
+
+func initTransports(numTransports int) {
+
+	for i := 0; i < numTransports; i++ {
+		var transport = &http.Transport{
+			Dial: (&net.Dialer{
+				Timeout:   15 * time.Second,
+				KeepAlive: 15 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout: 10 * time.Second,
+			MaxIdleConns:        30,
+			MaxIdleConnsPerHost: 30,
+			IdleConnTimeout:     25 * time.Second,
+		}
+		outTransports = append(outTransports, transport)
+	}
+
+	fmt.Printf("Initialized %d transports\n", len(outTransports))
 }
 
 func initProxyTransports(numSocksTransports int) {
@@ -332,6 +376,17 @@ func fetchAnnotations(video *Video) {
 		video.Annotations = ""
 		video.InfoJSON.Annotations = ""
 	}
+}
+
+func writeFilesForRemoteUpload(video *Video) {
+	JSON, _ := JSONMarshalIndentNoEscapeHTML(video.InfoJSON, "", " ")
+	combinedOutFile.mutex.Lock()
+	defer combinedOutFile.mutex.Unlock()
+	if combinedOutFile.recID > 0 { //add delimiter if not first record
+		combinedOutFile.outFile.Write([]byte(","))
+	}
+	combinedOutFile.recID++
+	combinedOutFile.outFile.Write(JSON)
 }
 
 func writeFiles(video *Video) {
@@ -514,6 +569,16 @@ func parsePlayerArgs(video *Video, document *goquery.Document) {
 			}
 
 		}
+	})
+}
+
+func parseIsCommentsEnabled(video *Video, document *goquery.Document) {
+	document.Find("#watch-discussion").EachWithBreak(func(i int, s *goquery.Selection) bool {
+		text := s.Text()
+		if strings.Contains(text, "disabled") {
+			video.InfoJSON.IsCommentsEnabled = false
+		}
+		return false
 	})
 }
 
@@ -823,46 +888,40 @@ func parseCaptionAuthors(video *Video, document *goquery.Document) {
 		title := s.Find("h4").Text()
 		title = strings.TrimSpace(title)
 
-		s.Find("a.yt-uix-sessionlink").EachWithBreak(func(j int, l *goquery.Selection) bool {
+		s.Find("ul.watch-info-tag-list").EachWithBreak(func(j int, t *goquery.Selection) bool {
 			newCredit := Credit{}
 			newCredit.Title = title
-			newCredit.Author = l.Text()
+			newCredit.Author = t.Text()
 			newCredit.Author = strings.TrimSpace(newCredit.Author)
-			newCredit.URL = l.AttrOr("href", "")
-			video.InfoJSON.Credits = append(video.InfoJSON.Credits, newCredit)
+			hadLinks := false
+			t.Find("a.yt-uix-sessionlink").EachWithBreak(func(j int, l *goquery.Selection) bool {
+				newCredit.URL = l.AttrOr("href", "")
+				newCredit.Author = l.Text()
+				newCredit.Author = strings.TrimSpace(newCredit.Author)
+				video.InfoJSON.Credits = append(video.InfoJSON.Credits, newCredit)
+				hadLinks = true
+				return true
+			})
+			if !hadLinks {
+				video.InfoJSON.Credits = append(video.InfoJSON.Credits, newCredit)
+			}
 			return true
 		})
 		return true
 	})
-	/*
-		//fmt.Println("parseCaptionAuthors")
-		for _, match := range m {
-			//fmt.Print(strconv.Itoa(i) + " ")
-			if (len(match[2])) > 1 {
-				language := match[2]
-				if language[0:1] == "s" { //strip s from authors
-					language = language[1:]
-				}
-				language = strings.TrimSpace(language)
-				language = language[1 : len(language)-1]
-				//fmt.Println(language)
-				doc, err := goquery.NewDocumentFromReader(strings.NewReader(match[3]))
-				if err != nil {
-					panic(err)
-				}
-				authors := doc.Find("a")
-				authors.Each(func(i int, s *goquery.Selection) {
-					newAuthor := CaptionAuthor{}
-					newAuthor.Author = s.Text()
-					newAuthor.Language = language
-					URL, _ := s.Attr("href")
-					newAuthor.URL = URL
-					//fmt.Println(newAuthor)
-					video.InfoJSON.CaptionAuthors = append(video.InfoJSON.CaptionAuthors, newAuthor)
-				})
+
+}
+
+func parseViewCount(video *Video, document *goquery.Document) {
+	document.Find("div").Each(func(i int, s *goquery.Selection) {
+		if name, _ := s.Attr("class"); name == "watch-view-count" {
+			viewCount := s.Text()
+			video.InfoJSON.ViewCount = cast.ToInt64(regLeaveOnlyDigits.ReplaceAllString(viewCount, ""))
+			if video.InfoJSON.ViewCount == 0 && video.InteractionCount > 0 {
+				video.InfoJSON.ViewCount = video.InteractionCount
 			}
 		}
-	*/
+	})
 }
 
 func parseCategory(video *Video, document *goquery.Document) {
@@ -941,8 +1000,10 @@ func parseVariousInfo(video *Video, document *goquery.Document) {
 
 	video.InfoJSON.AllowEmbed = false
 
-	if val, ok := video.playerArgs["allow_embed"]; ok {
-		video.InfoJSON.AllowEmbed, _ = strconv.ParseBool(val.(string))
+	if playabilityStatus, ok := video.playerResponse["playabilityStatus"].(map[string]interface{}); ok {
+		if val, ok2 := playabilityStatus["playableInEmbed"]; ok2 {
+			video.InfoJSON.AllowEmbed, _ = val.(bool)
+		}
 	}
 	video.InfoJSON.IsCrawlable = true
 	if vidDetails, ok1 := video.playerResponse["videoDetails"].(map[string]interface{}); ok1 {
@@ -963,9 +1024,6 @@ func parseVariousInfo(video *Video, document *goquery.Document) {
 		if val, ok2 := vidDetails["averageRating"]; ok2 {
 			video.InfoJSON.AverageRating = val.(float64)
 		}
-		if val, ok2 := vidDetails["viewCount"]; ok2 {
-			video.InfoJSON.ViewCount, _ = strconv.ParseInt(val.(string), 10, 64)
-		}
 
 	}
 	parseRecommendedVideos(video, document)
@@ -973,6 +1031,7 @@ func parseVariousInfo(video *Video, document *goquery.Document) {
 	parseHeadlineBadge(video, document)
 	parseRegionsAllowed(video, document)
 	parseIsAdsEnabled(video, document)
+	parseIsCommentsEnabled(video, document)
 	parseUploaderInfo(video, document)
 	parseLikeDislike(video, document)
 	parseDatePublished(video, document)
@@ -981,6 +1040,7 @@ func parseVariousInfo(video *Video, document *goquery.Document) {
 	parseFormats(video)
 	parseTags(video, document)
 	parseCategory(video, document)
+	parseViewCount(video, document)
 	parseAgeLimit(video)
 	parseDuration(video)
 	parseUnavailable(video, document)
@@ -1141,26 +1201,6 @@ func downloadSub(video *Video, langCode string, lang string, directURL string, i
 
 func fetchSubsList(video *Video) {
 	// request subtitles list
-	/*res, err := http.Get("http://video.google.com/timedtext?hl=en&type=list&v=" + video.ID)
-	if err != nil {
-		color.Println(color.Yellow("[") + color.Red("!") + color.Yellow("]") + color.Yellow("[") + color.Cyan(video.ID) + color.Yellow("]") + color.Red(" Unable to fetch subtitles!"))
-		runtime.Goexit()
-	}
-	// defer it!
-	defer res.Body.Close()
-	// check status, exit if != 200
-	if res.StatusCode != 200 {
-		color.Println(color.Yellow("[") + color.Red("!") + color.Yellow("]") + color.Yellow("[") + color.Cyan(video.ID) + color.Yellow("]") + color.Red(" Unable to fetch subtitles!"))
-		//runtime.Goexit()
-	}
-	// reading tracks list as a byte array
-	data, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		color.Println(color.Yellow("[") + color.Red("!") + color.Yellow("]") + color.Yellow("[") + color.Cyan(video.ID) + color.Yellow("]") + color.Red(" Unable to fetch subtitles!"))
-		runtime.Goexit()
-	}
-	xml.Unmarshal(data, &tracks)
-	fmt.Println(tracks)*/
 	var tracks Tracklist
 
 	json := video.playerResponse
@@ -1341,29 +1381,46 @@ func processSingleID(ID string, count *int64) {
 		logInfo("-", video, "Error Video ID incorrect lenght.")
 		return
 	}
-	if !checkFiles(video) {
-		genPath(video)
-		logInfo("-", video, "START")
+	isRemoteRun := len(cmdFlags.MasterServer) > 0
+
+	if isRemoteRun || !checkFiles(video) {
+		if !isRemoteRun {
+			genPath(video)
+			logInfo("-", video, "START")
+		}
+
 		//logInfo("~", video, "Parsing infos, description, title and thumbnail..")
 		parseHTML(video)
 		//logInfo("~", video, "Fetching subtitles..")
 		if len(video.InfoJSON.UnavailableMessage) == 0 { // video is available
-			fetchSubsList(video)
+			if !isRemoteRun {
+				fetchSubsList(video)
+			}
 		} else {
 			logInfo("~", video, "Video UnavailableMessage  "+strings.Replace(video.InfoJSON.UnavailableMessage, "\n", " ", -1))
 		}
 		//logInfo("~", video, "Fetching annotations..")
-		if cmdFlags.GetAnnotation {
+		if !isRemoteRun && cmdFlags.GetAnnotation {
 			fetchAnnotations(video)
 		}
 		//logInfo("~", video, "Writing informations locally..")
-		if cmdFlags.GetThumbnail {
+		if !isRemoteRun && cmdFlags.GetThumbnail {
 			logInfo("~", video, "Downloading thumbnail..")
 			downloadThumbnail(video)
 		}
 
-		writeFiles(video)
-		logInfo("✓", video, "DONE")
+		if isRemoteRun {
+			writeFilesForRemoteUpload(video)
+		} else {
+			writeFiles(video)
+		}
+		if !isRemoteRun {
+			logInfo("✓", video, "DONE")
+		} else {
+			if combinedOutFile.recID%50 == 0 {
+				logInfo("✓", video, "DONE"+fmt.Sprintf(" %d videos processed", combinedOutFile.recID))
+			}
+		}
 	}
 }
 
@@ -1381,7 +1438,7 @@ func logInfo(info string, video *Video, log string) {
 	}
 }
 
-func processList(maxConc int64, path string) {
+func processList(maxConc int64, path string, tempFile string) {
 	var count int64
 	count = 0
 
@@ -1394,6 +1451,29 @@ func processList(maxConc int64, path string) {
 	// scan the list line by line
 	scanner := bufio.NewScanner(file)
 	// scan the list line by line
+	var videosFile *os.File
+	var videosFileGz *gzip.Writer
+	var fileCreateError error
+
+	if len(cmdFlags.MasterServer) > 0 {
+		videosFile, fileCreateError = os.Create(tempFile)
+		if fileCreateError != nil {
+			fmt.Fprintf(os.Stderr, "Error creating videos.json.gz: %v\n", fileCreateError)
+			runtime.Goexit()
+		}
+		defer videosFile.Close()
+
+		videosFileGz, fileCreateError = gzip.NewWriterLevel(videosFile, gzip.BestCompression)
+		if fileCreateError != nil {
+			fmt.Fprintf(os.Stderr, "Error creating gzip writer videos.json.gz: %v\n", fileCreateError)
+			runtime.Goexit()
+		}
+		defer videosFileGz.Close()
+		combinedOutFile.recID = 0
+		combinedOutFile.outFile = videosFileGz
+		combinedOutFile.outFile.Write([]byte("["))
+	}
+
 	for scanner.Scan() {
 		for true {
 			if count < maxConc {
@@ -1411,14 +1491,23 @@ func processList(maxConc int64, path string) {
 		log.Fatal(err)
 	}
 	i := 0
+	fmt.Printf("Waiting for threads to complete\n")
 	for i < 5000 {
 		i++
 		if count <= 0 {
 			break
 		} else {
-			fmt.Fprintf(os.Stderr, "count: %d\n", count)
+			//fmt.Fprintf(os.Stderr, "count: %d\n", count)
 			time.Sleep(20 * time.Millisecond)
 		}
+	}
+
+	if len(cmdFlags.MasterServer) > 0 {
+		combinedOutFile.mutex.Lock()
+		defer combinedOutFile.mutex.Unlock()
+		combinedOutFile.outFile.Write([]byte("]"))
+		videosFileGz.Close()
+		fmt.Println(fmt.Sprintf("Batch downloaded %d videos processed", combinedOutFile.recID))
 	}
 
 }
@@ -1442,12 +1531,27 @@ func populateFlags(args []string) {
 	flag.BoolVar(&cmdFlags.DualFormatExistCheck, "DualFormatExistCheck", cmdFlags.DualFormatExistCheck, "a bool")
 	flag.BoolVar(&cmdFlags.RemoveRedundantData, "RemoveRedundantData", cmdFlags.RemoveRedundantData, "a bool")
 	flag.BoolVar(&cmdFlags.UseSockProxy, "UseSockProxy", cmdFlags.UseSockProxy, "a bool")
+	flag.StringVar(&cmdFlags.MasterServer, "MasterServer", cmdFlags.MasterServer, "a string")
 	flag.IntVar(&cmdFlags.SubPathLen, "SubPathLen", cmdFlags.SubPathLen, "an int")
+	flag.Int64Var(&cmdFlags.Concurrency, "Concurrency", cmdFlags.Concurrency, "an int")
+
 	flag.Parse()
 }
+
+var controlClient = &http.Client{Timeout: 10 * time.Second}
+
+func getJSON(url string, target interface{}) error {
+	r, err := controlClient.Get(url)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+
+	return json.NewDecoder(r.Body).Decode(target)
+}
+
 func argumentParsing(args []string) {
 	var maxConc int64
-	maxConc = 8
 
 	populateFlags(args)
 	tailArgs := flag.Args()
@@ -1456,31 +1560,114 @@ func argumentParsing(args []string) {
 	//fmt.Println(tailArgs)
 	//log.Fatal("exit")
 
-	if len(tailArgs) > 2 {
-		color.Red("Usage: ./youtube-ma [ID or list of IDs] [CONCURRENCY]")
-		os.Exit(1)
-	} else if len(tailArgs) == 2 {
-		if _, err := strconv.ParseInt(tailArgs[1], 10, 64); err == nil {
-			maxConc, _ = strconv.ParseInt(tailArgs[1], 10, 64)
-		} else {
-			color.Red("Usage: ./youtube-ma [ID or list of IDs] [CONCURRENCY]")
-			os.Exit(1)
-		}
-	}
+	maxConc = cmdFlags.Concurrency
 
 	if cmdFlags.UseSockProxy {
 		initProxyTransports((int)(maxConc))
 	} else {
-		loadOutIpsFromFile("outips.txt")
+		initTransports((int)(maxConc))
 	}
 	var count int64
 	count = 1
-	if _, err := os.Stat(tailArgs[0]); err == nil {
-		processList(maxConc, tailArgs[0])
-	} else {
-		processSingleID(tailArgs[0], &count)
-	}
 
+	fileWithIds := ""
+	isRemoteRun := len(cmdFlags.MasterServer) > 0
+
+	if len(tailArgs) > 0 {
+		fileWithIds = tailArgs[0]
+	}
+	batchID := ""
+	batchUUID := ""
+	tempFile := "videos.json.gz"
+
+	continueRunning := true
+	for continueRunning {
+		start := time.Now()
+		if isRemoteRun {
+			//fetch block from server
+			fileWithIds = "blockids.txt"
+			newWorkBatch := new(workBatch) // or &Foo{}
+
+			err := getJSON(cmdFlags.MasterServer+"/getBatchWorkUnit", newWorkBatch)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Unable to fetch getBatchWorkUnit: %v\n", err)
+				sleepTime := 20
+				fmt.Printf("Sleeping %d seconds and then will retry\n", sleepTime)
+				time.Sleep(time.Duration(sleepTime) * time.Second)
+				continue
+			}
+			batchID = newWorkBatch.BatchID
+			batchUUID = newWorkBatch.BatchUUID
+			fmt.Println(fmt.Sprintf("Recieved batch unit for download BatchID:%s (%s) - %d videos", batchID, batchUUID, len(newWorkBatch.VideoIDS)))
+
+			tempIDsFile, err := os.Create(fileWithIds)
+			defer tempIDsFile.Close()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			for idx, element := range newWorkBatch.VideoIDS {
+				if idx >= 1 {
+					tempIDsFile.WriteString("\n")
+				}
+				tempIDsFile.WriteString(element)
+
+			}
+			tempIDsFile.Close()
+		}
+
+		if _, err := os.Stat(fileWithIds); err == nil {
+			processList(maxConc, fileWithIds, tempFile)
+		} else {
+			processSingleID(fileWithIds, &count)
+		}
+
+		if isRemoteRun {
+			batchFileStats, _ := os.Stat(tempFile)
+			// get the size
+			size := batchFileStats.Size()
+
+			extraParams := map[string]string{
+				"batchID":    batchID,
+				"batchUUID":  batchUUID,
+				"videoCount": strconv.FormatInt(combinedOutFile.recID, 10),
+			}
+			try := 0
+			maxTries := 40
+			allDone := false
+			//NewPostFile("http://localhost:8080/upload", extraParams, "file", "D:\\new_tv\\Outlander.S04E13.720p.WEB.H264-METCON[eztv].mkv")
+			for allDone == false && try < maxTries {
+				try++
+				fmt.Printf("Uploading block %s (%s) with %d records, %d bytes, attempt %d\n", batchID, batchUUID, combinedOutFile.recID, size, try)
+
+				response, err := sendMultipart(cmdFlags.MasterServer+"/submitBatchWorkUnit", extraParams, "data", tempFile)
+				if err == nil && response.StatusCode == 200 {
+					fmt.Printf("Block %s uploaded\n", batchID)
+					allDone = true
+				} else {
+					if err != nil {
+						fmt.Printf("error uploading %v\n", err)
+					} else {
+						body, _ := ioutil.ReadAll(response.Body)
+						fmt.Printf("error uploading response code %d %s\n", response.StatusCode, body)
+					}
+					fmt.Printf("Block %s upload failed, try %d, will retry after sleep\n", batchID, try)
+					sleepTime := 5 * try
+					fmt.Printf("Sleeping %d seconds\n", sleepTime)
+					time.Sleep(time.Duration(sleepTime) * time.Second)
+				}
+			}
+			if !allDone {
+				fmt.Fprintf(os.Stderr, "Upload failed after retries, stopping program\n")
+				os.Exit(1)
+			}
+		}
+		color.Println(color.Cyan("Cycle done in ") + color.Yellow(time.Since(start)))
+
+		if !isRemoteRun {
+			continueRunning = false
+		}
+	}
 }
 
 // JSONMarshalIndentNoEscapeHTML allow proper json formatting
@@ -1498,10 +1685,10 @@ func JSONMarshalIndentNoEscapeHTML(i interface{}, prefix string, indent string) 
 }
 
 func main() {
-	start := time.Now()
-	runtime.GOMAXPROCS(250)
+
+	runtime.GOMAXPROCS(32)
 	rand.Seed(time.Now().Unix())
 
 	argumentParsing(os.Args[1:])
-	color.Println(color.Cyan("Done in ") + color.Yellow(time.Since(start)) + color.Cyan("!"))
+
 }
