@@ -1,18 +1,18 @@
 /*
- * yt-metadata-parser by Jopik
- * Extending Youtube-MA https://github.com/CorentinB/YouTube-MA
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- */
+yt-metadata-parser by Jopik
+Extending Youtube-MA https://github.com/CorentinB/YouTube-MA
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, version 3.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <http://www.gnu.org/licenses/>.
+*/
 package main
 
 import (
@@ -229,7 +229,7 @@ type Format struct {
 	Size         string  `json:"size,omitempty"`
 }
 
-// Format structure video quality labels
+// QualityLabel is the format structure video quality labels
 type QualityLabel struct {
 	ID       int
 	Label    string
