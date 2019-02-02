@@ -2,7 +2,7 @@ Youtube metadata parser in Golang, based on YouTube-MA https://github.com/Corent
 
 Works with multiple threads, parses the watch page and produces files in json format
 
-Dependancies
+Dependencies
 
 ```
 $ go get github.com/PuerkitoBio/goquery
